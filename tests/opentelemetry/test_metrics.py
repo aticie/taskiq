@@ -1,4 +1,5 @@
 import asyncio
+from multiprocessing import current_process
 from typing import Any
 
 from opentelemetry.sdk.metrics import MeterProvider
@@ -188,6 +189,29 @@ class TestTaskiqOTelMetrics(TestBase):
             points[0].attributes.get("task_name"),
             "tests.opentelemetry.taskiq_test_tasks:task_add",
         )
+
+    def test_worker_name_attribute_on_metrics(self) -> None:
+        async def test() -> None:
+            await task_add.kiq(1, 2)
+            await broker.wait_all()
+
+        asyncio.run(test())
+
+        worker_name = current_process().name
+        for metric_name in (
+            "task_success",
+            "task_execution_time",
+            "task_wait_time",
+            "worker_active_tasks",
+        ):
+            points = self._get_data_points(metric_name)
+            self.assertTrue(points, f"no data points for {metric_name}")
+            for point in points:
+                self.assertEqual(
+                    point.attributes.get("worker_name"),
+                    worker_name,
+                    f"missing worker_name on {metric_name}",
+                )
 
     def test_prefetch_queue_counter(self) -> None:
         middleware = next(

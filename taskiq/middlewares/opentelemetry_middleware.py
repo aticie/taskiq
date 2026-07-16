@@ -3,6 +3,7 @@ from collections.abc import Generator
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from importlib.metadata import version
+from multiprocessing import current_process
 from typing import Any, TypeVar
 
 import psutil
@@ -61,6 +62,7 @@ _TASK_EXECUTE = "execute"
 
 _TASK_RETRY_REASON_KEY = "taskiq.retry.reason"
 _TASK_NAME_KEY = "taskiq.task_name"
+_TASK_WORKER_NAME_KEY = "taskiq.worker_name"
 
 _TASK_QUEUE_TIME_KEY = "_taskiq_queue_time"
 _TASK_RECEIVED_TIME_KEY = "_taskiq_broker_receive_time"
@@ -156,6 +158,9 @@ class OpenTelemetryMiddleware(TaskiqMiddleware):
         meter: Meter | None = None,
     ) -> None:
         super().__init__()
+        # Resolved lazily so it reflects the worker process name rather than
+        # the process the middleware was constructed in (before the fork).
+        self._worker_name: str | None = None
         self._tracer = (
             trace.get_tracer(
                 __name__,
@@ -237,13 +242,26 @@ class OpenTelemetryMiddleware(TaskiqMiddleware):
             description="Number of tasks currently prefetched in the worker.",
         )
 
+    @property
+    def worker_name(self) -> str:
+        """Name of the current worker process, resolved and cached lazily."""
+        if self._worker_name is None:
+            self._worker_name = current_process().name
+        return self._worker_name
+
     def _observe_memory(self, options: Any) -> Generator[Observation, None, None]:
         if self.broker and self.broker.is_worker_process:
-            yield Observation(self._process.memory_info().rss)
+            yield Observation(
+                self._process.memory_info().rss,
+                attributes={"worker_name": self.worker_name},
+            )
 
     def _observe_cpu(self, options: Any) -> Generator[Observation, None, None]:
         if self.broker and self.broker.is_worker_process:
-            yield Observation(self._process.cpu_percent())
+            yield Observation(
+                self._process.cpu_percent(),
+                attributes={"worker_name": self.worker_name},
+            )
 
     def pre_send(self, message: TaskiqMessage) -> TaskiqMessage:
         """
@@ -308,13 +326,19 @@ class OpenTelemetryMiddleware(TaskiqMiddleware):
             kind=trace.SpanKind.CONSUMER,
         )
 
+        if span.is_recording():
+            span.set_attribute(_TASK_WORKER_NAME_KEY, self.worker_name)
+
         activation = trace.use_span(span, end_on_exit=True)
         activation.__enter__()  # pylint: disable=E1101
         attach_context(message, span, activation, token)
         message.labels[_TASK_RECEIVED_TIME_KEY] = datetime.now(timezone.utc).timestamp()
         self.number_of_broker_active_tasks.add(
             1,
-            attributes={"task_name": message.task_name},
+            attributes={
+                "task_name": message.task_name,
+                "worker_name": self.worker_name,
+            },
         )
         return message
 
@@ -417,22 +441,34 @@ class OpenTelemetryMiddleware(TaskiqMiddleware):
                 # Add retry reason metadata to span
                 self.n_errors_counter.add(
                     1,
-                    attributes={"retry_error": True, "task_name": message.task_name},
+                    attributes={
+                        "retry_error": True,
+                        "task_name": message.task_name,
+                        "worker_name": self.worker_name,
+                    },
                 )
             else:
                 self.n_errors_counter.add(
                     1,
-                    attributes={"retry_error": False, "task_name": message.task_name},
+                    attributes={
+                        "retry_error": False,
+                        "task_name": message.task_name,
+                        "worker_name": self.worker_name,
+                    },
                 )
         else:
             self.n_success_counter.add(
                 1,
-                attributes={"task_name": message.task_name},
+                attributes={
+                    "task_name": message.task_name,
+                    "worker_name": self.worker_name,
+                },
             )
         self.execution_time_hist.record(
             result.execution_time,
             attributes={
                 "task_name": message.task_name,
+                "worker_name": self.worker_name,
             },
         )
         task_receive_time = message.labels.get(_TASK_RECEIVED_TIME_KEY)
@@ -440,18 +476,30 @@ class OpenTelemetryMiddleware(TaskiqMiddleware):
         if task_receive_time is not None and task_send_time is not None:
             self.task_wait_time.record(
                 amount=task_receive_time - task_send_time,
-                attributes={"task_name": message.task_name},
+                attributes={
+                    "task_name": message.task_name,
+                    "worker_name": self.worker_name,
+                },
             )
 
         self.number_of_broker_active_tasks.add(
             -1,
-            attributes={"task_name": message.task_name},
+            attributes={
+                "task_name": message.task_name,
+                "worker_name": self.worker_name,
+            },
         )
 
     def on_prefetch_queue_add(self) -> None:
         """This hook is called after task is added to the worker prefetch queue."""
-        self.number_of_broker_prefetched_tasks.add(1)
+        self.number_of_broker_prefetched_tasks.add(
+            1,
+            attributes={"worker_name": self.worker_name},
+        )
 
     def on_prefetch_queue_remove(self) -> None:
         """This hook is called after task is removed from the worker prefetch queue."""
-        self.number_of_broker_prefetched_tasks.add(-1)
+        self.number_of_broker_prefetched_tasks.add(
+            -1,
+            attributes={"worker_name": self.worker_name},
+        )

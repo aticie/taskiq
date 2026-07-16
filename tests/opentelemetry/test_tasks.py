@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from multiprocessing import current_process
 from typing import Any
 
 from opentelemetry import baggage, context
@@ -52,6 +53,7 @@ class TestTaskiqInstrumentation(TestBase):
             {
                 "taskiq.action": "execute",
                 "taskiq.task_name": "tests.opentelemetry.taskiq_test_tasks:task_add",
+                "taskiq.worker_name": current_process().name,
             },
         )
 
